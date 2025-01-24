@@ -1,0 +1,177 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <BlynkSimpleShieldEsp8266.h>
+#include <ESP8266_Lib.h>
+
+// Definisi Pin
+#define DHT22_PIN 7
+#define PH_PIN A0
+#define TURBIDITY_PIN A1
+#define TDS_PIN A2
+
+// Definisikan server Flask
+const char* serverName = "http://<IP_BACKEND_FLASK>:5000/api/sensor-data"; // Ganti <IP_BACKEND_FLASK> dengan IP server Flask
+
+// Informasi WiFi
+const char* ssid = "Samsung A32";        // Ganti dengan nama WiFi Anda
+const char* password = "Grt130716";      // Ganti dengan password WiFi Anda
+
+// Blynk Info
+#define BLYNK_TEMPLATE_ID "TMPL6YfvBMlY8"
+#define BLYNK_TEMPLATE_NAME "hydrooo"
+#define BLYNK_AUTH_TOKEN "4G7MtSWGsW7FvuA8RvhH0oJ60TJbEilo"
+
+DHT dht22(DHT22_PIN, DHT22);
+SoftwareSerial esp8266Serial(2, 3); // RX dan TX
+ESP8266 esp8266(&esp8266Serial);    // Instance ESP8266 untuk pustaka Blynk
+
+// LCD I2C
+LiquidCrystal_I2C lcd(0x27, 20, 4); // Ganti 0x27 dengan alamat I2C LCD Anda
+
+// Variabel untuk sensor pH
+float Po = 0;
+float PH_step;
+int nilai_analog_PH;
+double TeganganPh;
+
+// Kalibrasi sensor pH
+float PH4 = 1.704; // Tegangan untuk pH 4.01
+float PH7 = 1.914; // Tegangan untuk pH 7.00
+
+// Fungsi untuk membaca tingkat kekeruhan (NTU)
+float getTurbidityNTU() {
+  int sensorValue = analogRead(TURBIDITY_PIN);
+  float voltage = sensorValue * (5.0 / 1023.0);
+  float NTU = -1120.4 * pow(voltage, 2) + 5742.3 * voltage - 4352.9;
+  if (NTU < 0) NTU = 0;
+  return NTU;
+}
+
+// Fungsi untuk membaca TDS dalam ppm
+float convertToTDS(int analogValue) {
+  float voltage = analogValue * (5.0 / 1023.0);
+  float tdsValue = (133.42 * voltage * voltage * voltage - 255.86 * voltage * voltage + 857.39 * voltage) * 0.5;
+  return tdsValue;
+}
+
+void sendDataToFlask(float tempC, float humidity, float pH, float turbidity, float tdsPPM) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // Menyiapkan payload JSON
+    String payload = "{\"temperature\": " + String(tempC) + "," +
+                     "\"humidity\": " + String(humidity) + "," +
+                     "\"ph\": " + String(pH) + "," +
+                     "\"turbidity\": " + String(turbidity) + "," +
+                     "\"tds\": " + String(tdsPPM) + "}";
+
+    // Mengirimkan data ke server Flask
+    http.begin(serverName);
+    http.addHeader("Content-Type", "application/json");  // Set header sebagai JSON
+    int httpResponseCode = http.POST(payload);  // Kirim data menggunakan POST
+
+    // Cek status pengiriman
+    if (httpResponseCode > 0) {
+      Serial.print("Data terkirim dengan status: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error saat mengirim data: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();  // Tutup koneksi
+  } else {
+    Serial.println("Koneksi WiFi gagal");
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  esp8266Serial.begin(9600); // Inisialisasi komunikasi serial dengan modul ESP8266
+  Blynk.begin(BLYNK_AUTH_TOKEN, esp8266, ssid, password);
+
+  // Setup WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Mencoba menghubungkan ke WiFi...");
+  }
+  Serial.println("Terhubung ke WiFi");
+
+  // Inisialisasi sensor DHT22
+  dht22.begin();
+  pinMode(PH_PIN, INPUT);
+  pinMode(TURBIDITY_PIN, INPUT);
+  pinMode(TDS_PIN, INPUT);
+
+  // Inisialisasi LCD
+  lcd.init();         // Inisialisasi LCD
+  lcd.backlight();    // Aktifkan backlight
+  lcd.setCursor(0, 0);
+  lcd.print("Monitoring Air");
+  delay(1000); // Tampilkan pesan awal
+}
+
+void loop() {
+  Blynk.run();
+
+  // Baca data dari sensor
+  float humi = dht22.readHumidity();
+  float tempC = dht22.readTemperature();
+
+  if (isnan(humi) || isnan(tempC)) {
+    Serial.println("Gagal membaca dari sensor DHT22!");
+  } else {
+    nilai_analog_PH = analogRead(PH_PIN);
+    TeganganPh = 5.0 / 1024.0 * nilai_analog_PH;
+    PH_step = (PH4 - PH7) / 3;
+    Po = 7.00 + ((PH7 - TeganganPh) / PH_step);
+
+    float turbidity = getTurbidityNTU();
+    int tdsValue = analogRead(TDS_PIN);
+    float tdsPPM = convertToTDS(tdsValue);
+
+    // Kirim data ke Blynk
+    Blynk.virtualWrite(V0, tempC);     // Virtual Pin V0 untuk suhu
+    Blynk.virtualWrite(V1, Po);        // Virtual Pin V1 untuk pH
+    Blynk.virtualWrite(V2, turbidity); // Virtual Pin V2 untuk kekeruhan
+    Blynk.virtualWrite(V3, tdsPPM);    // Virtual Pin V3 untuk TDS
+
+    // Tampilkan hasil di Serial Monitor
+    Serial.println("\n==========================================");
+    Serial.print("Suhu: "); Serial.print(tempC); Serial.println("°C");
+    Serial.print("Kelembapan: "); Serial.print(humi); Serial.println("%");
+    Serial.print("Nilai pH: "); Serial.println(Po, 2);
+    Serial.print("Kekeruhan: "); Serial.print(turbidity); Serial.println(" NTU");
+    Serial.print("TDS: "); Serial.print(tdsPPM); Serial.println(" ppm");
+    Serial.println("==========================================");
+
+    // Tampilkan hasil di LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Suhu: ");
+    lcd.print(tempC, 1);
+    lcd.print("C");
+
+    lcd.setCursor(0, 1);
+    lcd.print("pH: ");
+    lcd.print(Po, 2);
+
+    lcd.setCursor(0, 2);
+    lcd.print("Turbidity: ");
+    lcd.print(turbidity, 1);
+
+    lcd.setCursor(0, 3);
+    lcd.print("TDS: ");
+    lcd.print(tdsPPM, 1);
+    lcd.print(" ppm");
+
+    // Kirim data ke server Flask
+    sendDataToFlask(tempC, humi, Po, turbidity, tdsPPM);
+
+    delay(1000); // Tunggu sebelum siklus berikutnya
+  }
+}
